@@ -12,6 +12,7 @@ paths, returning None cleanly without raising.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -67,7 +68,10 @@ def test_fastembed_mean_pooling_warning_is_suppressed_for_multilingual_minilm():
         text=True,
     )
 
-    assert result.stderr == ""
+    # Unrelated native logging (e.g. onnxruntime's device_discovery PCI
+    # warnings on some CI runners) may reach stderr; the only thing under
+    # test is that the pooling migration warning is suppressed.
+    assert "now uses mean pooling" not in result.stderr
 
 
 def test_is_disabled_no_embeddings_flag(monkeypatch):
