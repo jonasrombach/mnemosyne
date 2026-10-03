@@ -113,17 +113,32 @@ def _get_prefix(kind: str) -> str:
 def _is_disabled() -> bool:
     """True when dense retrieval has been opted out via env var.
 
-    Three flags, in priority order:
+    Three equivalent flags (any true value disables embeddings):
     - MNEMOSYNE_NO_EMBEDDINGS: hard off, used in CI and unit tests that
       exercise non-embedding code paths
     - MNEMOSYNE_SKIP_EMBEDDINGS: same intent, shorter alias
     - MNEMOSYNE_EMBEDDINGS_OFF: same intent, longer alias
+
+    Values are trimmed and case-insensitive: 1/true/yes/on are true;
+    0/false/no/off, blank and unset are false. Validate every alias before
+    combining them, so a true flag cannot hide a malformed one. Other
+    nonempty values raise ValueError. This is ENV-only, not YAML resolution.
     """
-    return bool(
-        os.environ.get("MNEMOSYNE_NO_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_SKIP_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_EMBEDDINGS_OFF")
-    )
+    disabled = False
+    for name in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        raw = os.environ.get(name, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            disabled = True
+        elif raw not in ("", "0", "false", "no", "off"):
+            raise ValueError(
+                f"{name} must be 1/true/yes/on or 0/false/no/off "
+                "(blank or unset also means false)."
+            )
+    return disabled
 
 
 def _is_api_model(model_name: str) -> bool:
@@ -330,6 +345,32 @@ def _safe_api_endpoint(url: str) -> str:
         return "<invalid-url>"
 
 
+class _EmbeddingPolicyError(ValueError):
+    """A configuration/transport-policy refusal (credentialed cleartext
+    endpoint, credentialed redirect). Raised OUTSIDE the retry-and-degrade
+    machinery: unlike transient transport failures these must surface to the
+    caller instead of degrading to keyword-only recall."""
+
+
+class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects for key-bearing embedding requests.
+
+    urllib forwards the original request headers, Authorization included,
+    verbatim to the redirect target (verified against a local 302 hop), so a
+    credentialed request must never follow one: the target can be a cleartext
+    http:// URL or an unrelated https:// authority, and either leaks the
+    credential. Fail loud and let the operator point the env var at the final
+    endpoint URL instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _EmbeddingPolicyError(
+            f"Refusing to follow redirect to {newurl!r} for a credentialed "
+            "embedding request: urllib would forward Authorization to the "
+            "redirect target. Point MNEMOSYNE_EMBEDDING_API_URL at the "
+            "final endpoint URL."
+        )
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -338,6 +379,16 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     is_custom = "openrouter.ai" not in base_url
     if not is_custom and not _OPENAI_API_KEY:
         return None
+    if _OPENAI_API_KEY and not base_url.startswith("https://"):
+        # Fail loud before any request: sending Authorization (and the text
+        # being embedded) over cleartext http:// leaks both on the wire.
+        raise _EmbeddingPolicyError(
+            f"Refusing to send embedding credentials over non-HTTPS endpoint "
+            f"{base_url!r}: point MNEMOSYNE_EMBEDDING_API_URL at an https:// "
+            "URL, or unset MNEMOSYNE_EMBEDDING_API_KEY / OPENAI_API_KEY to "
+            "embed without credentials (for example a local endpoint that "
+            "needs no key)."
+        )
 
     url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
@@ -365,11 +416,26 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
             if cert_file:
                 ctx.load_verify_locations(cert_file)
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            if _OPENAI_API_KEY:
+                # Credentialed: refuse redirects (Authorization would be
+                # forwarded to the target); uncredentialed requests keep
+                # the default redirect behavior.
+                opener = urllib.request.build_opener(
+                    _CredentialedNoRedirect,
+                    urllib.request.HTTPSHandler(context=ctx),
+                )
+                resp_ctx = opener.open(req, timeout=30)
+            else:
+                resp_ctx = urllib.request.urlopen(req, timeout=30, context=ctx)
+            with resp_ctx as resp:
                 data = json.loads(resp.read())
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
+        except _EmbeddingPolicyError:
+            # Policy refusals (credentialed redirect) propagate; the generic
+            # handler below would otherwise degrade them to keyword-only.
+            raise
         except urllib.error.HTTPError as exc:
             # Retry rate limits and transient server failures, but surface
             # permanent client/authentication failures to callers as the
@@ -438,6 +504,9 @@ def available_api() -> bool:
 #     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
+    # Check outside the cached function: a warm hit must not bypass opt-out.
+    if _is_disabled():
+        return None
     if not text:
         return None
     return _embed_query_cached(_get_prefix("query") + text)
@@ -462,6 +531,8 @@ def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
 #     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
     """Encode texts (documents) into dense vectors."""
+    if _is_disabled():
+        return None
     if not texts:
         return None
     doc_prefix = _get_prefix("doc")
